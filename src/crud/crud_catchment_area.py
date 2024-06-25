@@ -495,7 +495,7 @@ class CRUDCatchmentArea:
                     FROM isochrones_filled
                 )
                 INSERT INTO {obj_in.result_table} (layer_id, geom, integer_attr1)
-                SELECT '{obj_in.layer_id}', COALESCE(j.geom, a.geom) AS geom, a.MINUTE
+                SELECT '{obj_in.layer_id}', ST_MakeValid(COALESCE(j.geom, a.geom)) AS geom, a.MINUTE
                 FROM isochrones_with_id a
                 LEFT JOIN LATERAL
                 (
