@@ -13,13 +13,22 @@ class SyncPostgresDsn(PostgresDsn):
 
 
 class Settings(BaseSettings):
+    DEBUG_MODE: bool = True
+
+    CUSTOMER_SCHEMA: str = "customer"
+    USER_DATA_SCHEMA: str = "user_data"
+
     API_V2_STR: str = "/api/v2"
     PROJECT_NAME: Optional[str] = "GOAT Routing API"
     CACHE_DIR: str = "/app/src/cache"
 
+    STREET_NETWORK_EDGE_DEFAULT_LAYER_PROJECT_ID = 36126
+    STREET_NETWORK_NODE_DEFAULT_LAYER_PROJECT_ID = 37319
+
     NETWORK_REGION_TABLE = "basic.geofence_active_mobility"
 
     CATCHMENT_AREA_CAR_BUFFER_DEFAULT_SPEED = 80  # km/h
+    CATCHMENT_AREA_HOLE_THRESHOLD_SQM = 10000  # 100m x 100m
 
     CELERY_BROKER_URL: Optional[str] = "pyamqp://guest@rabbitmq//"
     REDIS_HOST: Optional[str] = "redis"

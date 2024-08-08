@@ -1,5 +1,4 @@
 import math
-import os
 import time
 import uuid
 from typing import Any
@@ -7,12 +6,13 @@ from typing import Any
 import numpy as np
 import polars as pl
 from redis import Redis
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
-from tqdm import tqdm
 
 from src.core.config import settings
 from src.core.isochrone import compute_isochrone, compute_isochrone_h3
 from src.core.jsoline import generate_jsolines
+from src.core.street_network.street_network_util import StreetNetworkUtil
 from src.schemas.catchment_area import (
     SEGMENT_DATA_SCHEMA,
     VALID_BICYCLE_CLASSES,
@@ -27,79 +27,6 @@ from src.schemas.catchment_area import (
 )
 from src.schemas.error import BufferExceedsNetworkError, DisconnectedOriginError
 from src.schemas.status import ProcessingStatus
-from src.utils import make_dir
-
-
-class FetchRoutingNetwork:
-    def __init__(self, db_connection: AsyncSession):
-        self.db_connection = db_connection
-
-    async def fetch(self):
-        """Fetch routing network (processed segments) and load into memory."""
-
-        start_time = time.time()
-
-        # Get network H3 cells
-        h3_3_grid = []
-        try:
-            sql_get_h3_3_grid = f"""
-                WITH region AS (
-                    SELECT ST_Union(geom) AS geom FROM {settings.NETWORK_REGION_TABLE}
-                )
-                SELECT g.h3_short FROM region r,
-                LATERAL basic.fill_polygon_h3_3(r.geom) g;
-            """
-            result = (await self.db_connection.execute(sql_get_h3_3_grid)).fetchall()
-            for h3_index in result:
-                h3_3_grid.append(h3_index[0])
-        except Exception as e:
-            print(e)
-            # TODO Throw appropriate exception
-
-        # Load segments into polars data frames
-        segments_df = {}
-        df_size = 0.0
-        try:
-            # Create cache dir if it doesn't exist
-            make_dir(settings.CACHE_DIR)
-
-            for index in tqdm(
-                range(len(h3_3_grid)), desc="Loading H3_3 grid", unit=" cell"
-            ):
-                h3_index = h3_3_grid[index]
-
-                if os.path.exists(f"{settings.CACHE_DIR}/{h3_index}.parquet"):
-                    segments_df[h3_index] = pl.read_parquet(
-                        f"{settings.CACHE_DIR}/{h3_index}.parquet"
-                    )
-                else:
-                    segments_df[h3_index] = pl.read_database_uri(
-                        query=f"""
-                            SELECT
-                                id, length_m, length_3857, class_, impedance_slope, impedance_slope_reverse,
-                                impedance_surface, CAST(coordinates_3857 AS TEXT) AS coordinates_3857,
-                                maxspeed_forward, maxspeed_backward, source, target, h3_3, h3_6
-                            FROM basic.segment
-                            WHERE h3_3 = {h3_index}
-                        """,
-                        uri=settings.POSTGRES_DATABASE_URI,
-                        schema_overrides=SEGMENT_DATA_SCHEMA,
-                    )
-                    segments_df[h3_index] = segments_df[h3_index].with_columns(
-                        pl.col("coordinates_3857").str.json_extract()
-                    )
-
-                    with open(f"{settings.CACHE_DIR}/{h3_index}.parquet", "wb") as file:
-                        segments_df[h3_index].write_parquet(file)
-
-                df_size += segments_df[h3_index].estimated_size("gb")
-        except Exception as e:
-            print(e)
-
-        print(f"Network load time: {round((time.time() - start_time) / 60, 1)} min")
-        print(f"Network in-memory size: {round(df_size, 1)} GB")
-
-        return segments_df
 
 
 class CRUDCatchmentArea:
@@ -118,7 +45,7 @@ class CRUDCatchmentArea:
         """Read relevant sub-network for catchment area calculation from polars dataframe."""
 
         # Get valid segment classes based on transport mode
-        if type(obj_in) == ICatchmentAreaActiveMobility:
+        if type(obj_in) is ICatchmentAreaActiveMobility:
             valid_segment_classes = (
                 VALID_WALKING_CLASSES
                 if obj_in.routing_type == "walking"
@@ -128,11 +55,11 @@ class CRUDCatchmentArea:
             valid_segment_classes = VALID_CAR_CLASSES
 
         # Compute buffer distance for identifying relevant H3_6 cells
-        if type(obj_in.travel_cost) == CatchmentAreaTravelTimeCostActiveMobility:
+        if type(obj_in.travel_cost) is CatchmentAreaTravelTimeCostActiveMobility:
             buffer_dist = obj_in.travel_cost.max_traveltime * (
                 (obj_in.travel_cost.speed * 1000) / 60
             )
-        elif type(obj_in.travel_cost) == CatchmentAreaTravelTimeCostMotorizedMobility:
+        elif type(obj_in.travel_cost) is CatchmentAreaTravelTimeCostMotorizedMobility:
             buffer_dist = obj_in.travel_cost.max_traveltime * (
                 (settings.CATCHMENT_AREA_CAR_BUFFER_DEFAULT_SPEED * 1000) / 60
             )
@@ -143,9 +70,10 @@ class CRUDCatchmentArea:
         h3_3_cells = set()
         h3_6_cells = set()
 
-        sql_get_relevant_cells = f"""
+        sql_get_relevant_cells = text(
+            f"""
             WITH point AS (
-                SELECT geom FROM temporal.\"{input_table}\" LIMIT {num_points}
+                SELECT geom FROM "{input_table}" LIMIT {num_points}
             ),
             buffer AS (
                 SELECT ST_Buffer(point.geom::geography, {buffer_dist})::geometry AS geom
@@ -160,9 +88,10 @@ class CRUDCatchmentArea:
             FROM cells
             GROUP BY h3_3;
         """
-        for h3_3_cell in (
-            await self.db_connection.execute(sql_get_relevant_cells)
-        ).fetchall():
+        )
+        result = (await self.db_connection.execute(sql_get_relevant_cells)).fetchall()
+
+        for h3_3_cell in result:
             h3_3_cells.add(h3_3_cell[0])
             for h3_6_cell in h3_3_cell[1]:
                 h3_6_cells.add(h3_6_cell)
@@ -186,12 +115,80 @@ class CRUDCatchmentArea:
             else:
                 sub_network = sub_df
 
+        # Produce all network modifications required to apply the specified scenario
+        network_modifications_table = f"temporal.{str(uuid.uuid4()).replace('-', '_')}"
+        scenario_id = (
+            f"'{obj_in.scenario_id}'" if obj_in.scenario_id is not None else "NULL"
+        )
+        await self.db_connection.execute(
+            text(
+                f"""
+                SELECT basic.produce_network_modifications(
+                    {scenario_id},
+                    {settings.STREET_NETWORK_EDGE_DEFAULT_LAYER_PROJECT_ID},
+                    {settings.STREET_NETWORK_NODE_DEFAULT_LAYER_PROJECT_ID},
+                    '{network_modifications_table}'
+                );
+            """
+            )
+        )
+
+        # Apply network modifications to the sub-network
+        segments_to_discard = []
+        sql_get_network_modifications = text(
+            f"""
+            SELECT edit_type, id, class_, source, target,
+                length_m, length_3857, CAST(coordinates_3857 AS TEXT) AS coordinates_3857,
+                impedance_slope, impedance_slope_reverse, impedance_surface, maxspeed_forward,
+                maxspeed_backward, h3_6, h3_3
+            FROM "{network_modifications_table}";
+        """
+        )
+        result = (
+            await self.db_connection.execute(sql_get_network_modifications)
+        ).fetchall()
+
+        for modification in result:
+            if modification[0] == "d":
+                segments_to_discard.append(modification[1])
+                continue
+
+            new_segment = pl.DataFrame(
+                [
+                    {
+                        "id": modification[1],
+                        "length_m": modification[5],
+                        "length_3857": modification[6],
+                        "class_": modification[2],
+                        "impedance_slope": modification[8],
+                        "impedance_slope_reverse": modification[9],
+                        "impedance_surface": modification[10],
+                        "coordinates_3857": modification[7],
+                        "maxspeed_forward": modification[11],
+                        "maxspeed_backward": modification[12],
+                        "source": modification[3],
+                        "target": modification[4],
+                        "h3_3": modification[13],
+                        "h3_6": modification[14],
+                    }
+                ],
+                schema_overrides=SEGMENT_DATA_SCHEMA,
+            )
+            new_segment = new_segment.with_columns(
+                pl.col("coordinates_3857").str.json_extract()
+            )
+            sub_network.extend(new_segment)
+
+        # Remove segments which are deleted or modified due to the scenario
+        sub_network = sub_network.filter(~pl.col("id").is_in(segments_to_discard))
+
         # Create necessary artifical segments and add them to our sub network
         origin_point_connectors = []
         origin_point_cell_index = []
         origin_point_h3_3 = []
         segments_to_discard = []
-        sql_get_artificial_segments = f"""
+        sql_get_artificial_segments = text(
+            f"""
             SELECT
                 point_id,
                 old_id,
@@ -201,12 +198,15 @@ class CRUDCatchmentArea:
                 maxspeed_forward, maxspeed_backward, source, target,
                 h3_3, h3_6, point_cell_index, point_h3_3
             FROM basic.get_artificial_segments(
+                {settings.STREET_NETWORK_EDGE_DEFAULT_LAYER_PROJECT_ID},
+                '{network_modifications_table}',
                 '{input_table}',
                 {num_points},
                 '{",".join(valid_segment_classes)}',
                 10
             );
         """
+        )
         result = (
             await self.db_connection.execute(sql_get_artificial_segments)
         ).fetchall()  # TODO Check if artificial segments are even required for car routing
@@ -246,10 +246,8 @@ class CRUDCatchmentArea:
                 "Starting point(s) are disconnected from the street network."
             )
 
-        # Remove segments which are now replaced by artificial segments
+        # Remove segments which are replaced by artificial segments or modified due to the scenario
         sub_network = sub_network.filter(~pl.col("id").is_in(segments_to_discard))
-
-        # TODO: We need to read the scenario network dynamically from DB if a scenario is selected.
 
         # Replace all NULL values in the impedance columns with 0
         sub_network = sub_network.with_columns(pl.col("impedance_surface").fill_null(0))
@@ -266,7 +264,7 @@ class CRUDCatchmentArea:
                 speed=(
                     obj_in.travel_cost.speed / 3.6
                     if type(obj_in.travel_cost)
-                    == CatchmentAreaTravelTimeCostActiveMobility
+                    is CatchmentAreaTravelTimeCostActiveMobility
                     else None
                 ),
             )
@@ -292,6 +290,7 @@ class CRUDCatchmentArea:
 
         return (
             sub_network,
+            network_modifications_table,
             origin_point_connectors,
             origin_point_cell_index,
             origin_point_h3_3,
@@ -301,16 +300,18 @@ class CRUDCatchmentArea:
         """Create the input table for the catchment area calculation."""
 
         # Generate random table name
-        table_name = str(uuid.uuid4()).replace("-", "_")
+        table_name = f"temporal.{str(uuid.uuid4()).replace('-', '_')}"
 
         # Create temporary table for storing catchment area starting points
         await self.db_connection.execute(
-            f"""
-                CREATE TABLE temporal.\"{table_name}\" (
+            text(
+                f"""
+                CREATE TABLE "{table_name}" (
                     id serial PRIMARY KEY,
                     geom geometry(Point, 4326)
                 );
             """
+            )
         )
 
         # Insert catchment area starting points into the temporary table
@@ -322,20 +323,27 @@ class CRUDCatchmentArea:
                 f"(ST_SetSRID(ST_MakePoint({longitude}, {latitude}), 4326)),"
             )
         await self.db_connection.execute(
-            f"""
-                INSERT INTO temporal.\"{table_name}\" (geom)
+            text(
+                f"""
+                INSERT INTO "{table_name}" (geom)
                 VALUES {insert_string.rstrip(",")};
             """
+            )
         )
 
         await self.db_connection.commit()
 
         return table_name, len(obj_in.starting_points.latitude)
 
-    async def delete_input_table(self, table_name: str):
-        """Delete the input table after reading the relevant sub-network."""
+    async def drop_temp_tables(
+        self, input_table: str, network_modifications_table: str
+    ):
+        """Delete the temporary input and network modifications tables."""
 
-        await self.db_connection.execute(f'DROP TABLE temporal."{table_name}";')
+        await self.db_connection.execute(text(f'DROP TABLE "{input_table}";'))
+        await self.db_connection.execute(
+            text(f'DROP TABLE "{network_modifications_table}";')
+        )
         await self.db_connection.commit()
 
     def compute_segment_cost(self, sub_network, mode, speed):
@@ -423,11 +431,11 @@ class CRUDCatchmentArea:
         """Get H3_10 cell grid required for computing a grid-type catchment area."""
 
         # Compute buffer distance for identifying relevant H3_10 cells
-        if type(obj_in.travel_cost) == CatchmentAreaTravelTimeCostActiveMobility:
+        if type(obj_in.travel_cost) is CatchmentAreaTravelTimeCostActiveMobility:
             buffer_dist = obj_in.travel_cost.max_traveltime * (
                 (obj_in.travel_cost.speed * 1000) / 60
             )
-        elif type(obj_in.travel_cost) == CatchmentAreaTravelTimeCostMotorizedMobility:
+        elif type(obj_in.travel_cost) is CatchmentAreaTravelTimeCostMotorizedMobility:
             buffer_dist = obj_in.travel_cost.max_traveltime * (
                 (settings.CATCHMENT_AREA_CAR_BUFFER_DEFAULT_SPEED * 1000) / 60
             )
@@ -435,7 +443,8 @@ class CRUDCatchmentArea:
             buffer_dist = obj_in.travel_cost.max_distance
 
         # Fetch H3_10 cell grid relevant to the catchment area calculation
-        sql_get_relevant_cells = f"""
+        sql_get_relevant_cells = text(
+            f"""
             WITH cells AS (
                 SELECT DISTINCT(h3_grid_disk(sub.origin_h3_index, radius.value)) AS h3_index
                 FROM (SELECT UNNEST(ARRAY{origin_h3_10}::h3index[]) AS origin_h3_index) sub,
@@ -448,6 +457,7 @@ class CRUDCatchmentArea:
                 FROM h3_cell_to_lat_lng(h3_index) AS point
             ) sub;
         """
+        )
         result = (await db_connection.execute(sql_get_relevant_cells)).fetchall()
 
         h3_index = []
@@ -474,7 +484,8 @@ class CRUDCatchmentArea:
                 insert_string += f"SELECT ST_MakeValid(ST_SetSRID(ST_GeomFromText('{geom}'), 4326)) AS geom, {minute} AS minute UNION ALL "
             insert_string, _, _ = insert_string.rpartition(" UNION ALL ")
 
-            sql_insert_into_table = f"""
+            sql_insert_into_table = text(
+                f"""
                 WITH isochrones AS
                 (
                     SELECT p."minute", (ST_DUMP(p.geom)).geom
@@ -484,10 +495,11 @@ class CRUDCatchmentArea:
                 ),
                 isochrones_filled AS
                 (
-                    SELECT "minute", ST_COLLECT(ST_MAKEPOLYGON(st_exteriorring(geom))) geom
-                    FROM isochrones
+                    SELECT "minute", ST_COLLECT(ST_MAKEPOLYGON(ST_ExteriorRing(geom))) AS orig_geom, ST_COLLECT(filled) AS filled_geom
+                    FROM isochrones,
+                    LATERAL basic.fill_polygon_holes(geom, {settings.CATCHMENT_AREA_HOLE_THRESHOLD_SQM}) filled
                     GROUP BY "minute"
-                    ORDER BY "minute"
+                    ORDER BY "minute" DESC
                 ),
                 isochrones_with_id AS
                 (
@@ -495,16 +507,16 @@ class CRUDCatchmentArea:
                     FROM isochrones_filled
                 )
                 INSERT INTO {obj_in.result_table} (layer_id, geom, integer_attr1)
-                SELECT '{obj_in.layer_id}', COALESCE(j.geom, a.geom) AS geom, a.MINUTE
+                SELECT '{obj_in.layer_id}', ST_MakeValid(COALESCE(j.geom, a.filled_geom)) AS geom, a."minute"
                 FROM isochrones_with_id a
                 LEFT JOIN LATERAL
                 (
-                    SELECT ST_DIFFERENCE(a.geom, b.geom) AS geom
+                    SELECT ST_DIFFERENCE(a.filled_geom, b.orig_geom) AS geom
                     FROM isochrones_with_id b
-                    WHERE a.id - 1 = b.id
-                ) j ON {"TRUE" if obj_in.polygon_difference else "FALSE"}
-                ORDER BY a.MINUTE DESC;
+                    WHERE a.id + 1 = b.id
+                ) j ON {"TRUE" if obj_in.polygon_difference else "FALSE"};
             """
+            )
 
             await self.db_connection.execute(sql_insert_into_table)
             await self.db_connection.commit()
@@ -524,10 +536,12 @@ class CRUDCatchmentArea:
                     {cost}
                 ),"""
                 if i % batch_size == 0 or i == (len(network["features"]) - 1):
-                    insert_string = f"""
+                    insert_string = text(
+                        f"""
                         INSERT INTO {obj_in.result_table} (layer_id, geom, float_attr1)
                         VALUES {insert_string.rstrip(",")};
                     """
+                    )
                     await self.db_connection.execute(insert_string)
                     await self.db_connection.commit()
                     insert_string = ""
@@ -544,18 +558,22 @@ class CRUDCatchmentArea:
                     {grid[i]}
                 ),"""
                 if i % batch_size == 0 or i == (len(grid_index) - 1):
-                    insert_string = f"""
+                    insert_string = text(
+                        f"""
                         INSERT INTO {obj_in.result_table} (layer_id, text_attr1, integer_attr1)
                         VALUES {insert_string.rstrip(",")};
                     """
+                    )
                     await self.db_connection.execute(insert_string)
                     await self.db_connection.commit()
                     insert_string = ""
-            sql_update_geom = f"""
+            sql_update_geom = text(
+                f"""
                 UPDATE {obj_in.result_table}
                 SET geom = ST_SetSRID(h3_cell_to_boundary(text_attr1::h3index)::geometry, 4326)
                 WHERE layer_id = '{obj_in.layer_id}';
             """
+            )
             await self.db_connection.execute(sql_update_geom)
             await self.db_connection.commit()
 
@@ -564,7 +582,11 @@ class CRUDCatchmentArea:
 
         # Fetch routing network (processed segments) and load into memory
         if self.routing_network is None:
-            self.routing_network = await FetchRoutingNetwork(self.db_connection).fetch()
+            self.routing_network, _ = await StreetNetworkUtil(self.db_connection).fetch(
+                edge_layer_project_id=settings.STREET_NETWORK_EDGE_DEFAULT_LAYER_PROJECT_ID,
+                node_layer_project_id=None,
+                region_geofence_table=settings.NETWORK_REGION_TABLE,
+            )
         routing_network = self.routing_network
 
         total_start = time.time()
@@ -583,17 +605,21 @@ class CRUDCatchmentArea:
             input_table, num_points = await self.create_input_table(obj_in)
 
             # Read & process routing network to extract relevant sub-network
-            sub_routing_network, origin_connector_ids, origin_point_h3_10, _ = (
-                await self.read_network(
-                    routing_network,
-                    obj_in,
-                    input_table,
-                    num_points,
-                )
+            (
+                sub_routing_network,
+                network_modifications_table,
+                origin_connector_ids,
+                origin_point_h3_10,
+                _,
+            ) = await self.read_network(
+                routing_network,
+                obj_in,
+                input_table,
+                num_points,
             )
 
             # Delete input table for catchment area origin points
-            await self.delete_input_table(input_table)
+            await self.drop_temp_tables(input_table, network_modifications_table)
         except Exception as e:
             self.redis.set(str(obj_in.layer_id), ProcessingStatus.failure.value)
             await self.db_connection.rollback()
@@ -617,14 +643,14 @@ class CRUDCatchmentArea:
             ]
 
             if (
-                type(obj_in) == ICatchmentAreaActiveMobility
+                type(obj_in) is ICatchmentAreaActiveMobility
                 and is_travel_time_catchment_area
             ):
                 speed = obj_in.travel_cost.speed / 3.6
             else:
                 speed = None
 
-            if type(obj_in) == ICatchmentAreaActiveMobility:
+            if type(obj_in) is ICatchmentAreaActiveMobility:
                 zoom = 12
             else:
                 zoom = 10  # Use lower resolution grid for car catchment areas

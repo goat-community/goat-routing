@@ -22,6 +22,12 @@ SEGMENT_DATA_SCHEMA = {
     "h3_6": pl.Int32,
 }
 
+CONNECTOR_DATA_SCHEMA = {
+    "id": pl.Int64,
+    "h3_3": pl.Int32,
+    "h3_6": pl.Int32,
+}
+
 VALID_WALKING_CLASSES = [
     "secondary",
     "tertiary",
@@ -249,7 +255,7 @@ class ICatchmentAreaActiveMobility(BaseModel):
     scenario_id: UUID | None = Field(
         None,
         title="Scenario ID",
-        description="The ID of the scenario that is used for the routing.",
+        description="The ID of the scenario that is to be applied on the base network.",
     )
     catchment_area_type: CatchmentAreaType = Field(
         ...,

@@ -72,10 +72,10 @@ class FetchRoutingNetwork:
                     segments_df[h3_index] = pl.read_database_uri(
                         query=f"""
                             SELECT
-                                id, length_m, length_3857, class_, impedance_slope, impedance_slope_reverse,
+                                edge_id AS id, length_m, length_3857, class_, impedance_slope, impedance_slope_reverse,
                                 impedance_surface, CAST(coordinates_3857 AS TEXT) AS coordinates_3857,
                                 maxspeed_forward, maxspeed_backward, source, target, h3_3, h3_6
-                            FROM basic.segment
+                            FROM user_data.street_network_line_b6ddb594bfed4a8788b214af45378d75
                             WHERE h3_3 = {h3_index}
                         """,
                         uri=settings.POSTGRES_DATABASE_URI,
@@ -196,6 +196,7 @@ class CRUDCatchmentArea:
                 maxspeed_forward, maxspeed_backward, source, target,
                 h3_3, h3_6, point_cell_index, point_h3_3
             FROM basic.get_artificial_segments(
+                {settings.STREET_NETWORK_EDGE_DEFAULT_LAYER_PROJECT_ID},
                 '{input_table}',
                 {num_points},
                 '{",".join(valid_segment_classes)}',
