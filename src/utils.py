@@ -188,3 +188,10 @@ def make_dir(dir_path: str):
     """Creates a new directory if it doesn't already exist"""
     if not os.path.exists(dir_path):
         os.makedirs(dir_path)
+
+
+def format_value_null_sql(value) -> str:
+    if value is None:
+        return "NULL"
+    else:
+        return f"'{value}'"

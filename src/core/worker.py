@@ -1,6 +1,7 @@
 import asyncio
 
-from celery import Celery
+import sentry_sdk
+from celery import Celery, signals
 from redis import Redis
 
 from src.core.config import settings
@@ -14,6 +15,15 @@ redis = Redis(
     db=settings.REDIS_DB,
 )
 crud_catchment_area = CRUDCatchmentArea(async_session(), redis)
+
+
+@signals.celeryd_init.connect
+def init_sentry(**_kwargs):
+    sentry_sdk.init(
+        dsn=settings.SENTRY_DSN,
+        environment=settings.ENVIRONMENT,
+        traces_sample_rate=1.0 if settings.ENVIRONMENT == "prod" else 0.1,
+    )
 
 
 @celery_app.task

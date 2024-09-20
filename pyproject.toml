@@ -54,6 +54,7 @@ pyarrow = "^14.0.1"
 celery = "^5.3.6"
 redis = "^5.0.1"
 tqdm = "^4.66.1"
+sentry-sdk = {extras = ["celery", "fastapi"], version = "^2.14.0"}
 
 
 [tool.poetry.group.dev.dependencies]

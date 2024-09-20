@@ -1,4 +1,5 @@
 import os
+from uuid import UUID
 
 import polars as pl
 from polars import DataFrame
@@ -15,56 +16,50 @@ class StreetNetworkCache:
 
     def _get_edge_cache_file_name(
         self,
-        edge_layer_project_id: int,
+        edge_layer_id: UUID,
         h3_short: str,
     ):
         """Get edge cache file path for the specified H3_3 cell."""
 
         return os.path.join(
             settings.CACHE_DIR,
-            f"{edge_layer_project_id}_{h3_short}_edge.parquet",
+            f"{str(edge_layer_id)}_{h3_short}_edge.parquet",
         )
 
     def _get_node_cache_file_name(
         self,
-        node_layer_project_id: int,
+        node_layer_id: UUID,
         h3_short: str,
     ):
         """Get node cache file path for the specified H3_3 cell."""
 
         return os.path.join(
             settings.CACHE_DIR,
-            f"{node_layer_project_id}_{h3_short}_node.parquet",
+            f"{node_layer_id}_{h3_short}_node.parquet",
         )
 
-    def edge_cache_exists(self, edge_layer_project_id: int, h3_short: str):
+    def edge_cache_exists(self, edge_layer_id: UUID, h3_short: str):
         """Check if edge data for the specified H3_3 cell is cached."""
 
-        edge_cache_file = self._get_edge_cache_file_name(
-            edge_layer_project_id, h3_short
-        )
+        edge_cache_file = self._get_edge_cache_file_name(edge_layer_id, h3_short)
         return os.path.exists(edge_cache_file)
 
-    def node_cache_exists(self, node_layer_project_id: int, h3_short: str):
+    def node_cache_exists(self, node_layer_id: UUID, h3_short: str):
         """Check if node data for the specified H3_3 cell is cached."""
 
-        node_cache_file = self._get_node_cache_file_name(
-            node_layer_project_id, h3_short
-        )
+        node_cache_file = self._get_node_cache_file_name(node_layer_id, h3_short)
         return os.path.exists(node_cache_file)
 
     def read_edge_cache(
         self,
-        edge_layer_project_id: int,
+        edge_layer_id: UUID,
         h3_short: str,
     ):
         """Read edge data for the specified H3_3 cell from cache."""
 
         edge_df: DataFrame = None
 
-        edge_cache_file = self._get_edge_cache_file_name(
-            edge_layer_project_id, h3_short
-        )
+        edge_cache_file = self._get_edge_cache_file_name(edge_layer_id, h3_short)
 
         try:
             with open(edge_cache_file, "rb") as file:
@@ -78,16 +73,14 @@ class StreetNetworkCache:
 
     def read_node_cache(
         self,
-        node_layer_project_id: int,
+        node_layer_id: UUID,
         h3_short: str,
     ):
         """Read node data for the specified H3_3 cell from cache."""
 
         node_df: DataFrame = None
 
-        node_cache_file = self._get_node_cache_file_name(
-            node_layer_project_id, h3_short
-        )
+        node_cache_file = self._get_node_cache_file_name(node_layer_id, h3_short)
 
         try:
             with open(node_cache_file, "rb") as file:
@@ -101,15 +94,13 @@ class StreetNetworkCache:
 
     def write_edge_cache(
         self,
-        edge_layer_project_id: int,
+        edge_layer_id: UUID,
         h3_short: str,
         edge_df: DataFrame,
     ):
         """Write edge data for the specified H3_3 cell into cache."""
 
-        edge_cache_file = self._get_edge_cache_file_name(
-            edge_layer_project_id, h3_short
-        )
+        edge_cache_file = self._get_edge_cache_file_name(edge_layer_id, h3_short)
 
         try:
             with open(edge_cache_file, "wb") as file:
@@ -124,15 +115,13 @@ class StreetNetworkCache:
 
     def write_node_cache(
         self,
-        node_layer_project_id: int,
+        node_layer_id: UUID,
         h3_short: str,
         node_df: DataFrame,
     ):
         """Write node data for the specified H3_3 cell into cache."""
 
-        node_cache_file = self._get_node_cache_file_name(
-            node_layer_project_id, h3_short
-        )
+        node_cache_file = self._get_node_cache_file_name(node_layer_id, h3_short)
 
         try:
             with open(node_cache_file, "wb") as file:

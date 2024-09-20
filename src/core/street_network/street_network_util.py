@@ -14,23 +14,12 @@ class StreetNetworkUtil:
     def __init__(self, db_connection: AsyncSession):
         self.db_connection = db_connection
 
-    async def _get_layer_and_user_id(self, layer_project_id: int):
-        """Get the layer ID and user ID of the specified layer project ID."""
+    async def _get_user_id(self, layer_id: UUID):
+        """Get the user ID of the specified layer ID."""
 
-        layer_id: UUID = None
         user_id: UUID = None
 
         try:
-            # Get the associated layer ID
-            result = await self.db_connection.execute(
-                text(
-                    f"""SELECT layer_id
-                FROM {settings.CUSTOMER_SCHEMA}.layer_project
-                WHERE id = {layer_project_id};"""
-                )
-            )
-            layer_id = UUID(str(result.fetchone()[0]))
-
             # Get the user ID of the layer
             result = await self.db_connection.execute(
                 text(
@@ -41,55 +30,47 @@ class StreetNetworkUtil:
             )
             user_id = UUID(str(result.fetchone()[0]))
         except Exception:
-            raise ValueError(
-                f"Could not fetch layer and user ID for layer project ID {layer_project_id}."
-            )
+            raise ValueError(f"Could not fetch user ID for layer ID {layer_id}.")
 
-        return layer_id, user_id
+        return user_id
 
     async def _get_street_network_tables(
         self,
-        street_network_edge_layer_project_id: int,
-        street_network_node_layer_project_id: int,
+        edge_layer_id: UUID,
+        node_layer_id: UUID,
     ):
         """Get table names and layer IDs of the edge and node tables."""
 
         edge_table: str = None
-        edge_layer_id: UUID = None
         node_table: str = None
-        node_layer_id: UUID = None
 
-        # Get edge table name if a layer project ID is specified
-        if street_network_edge_layer_project_id:
+        # Get edge table name if a layer ID is specified
+        if edge_layer_id:
             try:
                 # Get the edge layer ID and associated user ID
-                edge_layer_id, user_id = await self._get_layer_and_user_id(
-                    street_network_edge_layer_project_id
-                )
+                user_id = await self._get_user_id(edge_layer_id)
 
                 # Produce the edge table name
                 edge_table = f"{settings.USER_DATA_SCHEMA}.street_network_line_{str(user_id).replace('-', '')}"
             except Exception:
                 raise ValueError(
-                    f"Could not fetch edge table name for layer project ID {street_network_edge_layer_project_id}."
+                    f"Could not fetch edge table name for layer ID {edge_layer_id}."
                 )
 
-        # Get node table name if a layer project ID is specified
-        if street_network_node_layer_project_id:
+        # Get node table name if a layer ID is specified
+        if node_layer_id:
             try:
                 # Get the node layer ID and associated user ID
-                node_layer_id, user_id = await self._get_layer_and_user_id(
-                    street_network_node_layer_project_id
-                )
+                user_id = await self._get_user_id(node_layer_id)
 
                 # Produce the node table name
                 node_table = f"{settings.USER_DATA_SCHEMA}.street_network_point_{str(user_id).replace('-', '')}"
             except Exception:
                 raise ValueError(
-                    f"Could not fetch node table name for layer project ID {street_network_node_layer_project_id}."
+                    f"Could not fetch node table name for layer ID {node_layer_id}."
                 )
 
-        return edge_table, edge_layer_id, node_table, node_layer_id
+        return edge_table, node_table
 
     async def _get_street_network_region_h3_3_cells(self, region_geofence_table: str):
         """Get list of H3_3 cells covering the street network region."""
@@ -118,8 +99,8 @@ class StreetNetworkUtil:
 
     async def fetch(
         self,
-        edge_layer_project_id: int,
-        node_layer_project_id: int,
+        edge_layer_id: UUID,
+        node_layer_id: UUID,
         region_geofence_table: str,
     ):
         """Fetch street network from specified layer and load into Polars dataframes."""
@@ -139,28 +120,22 @@ class StreetNetworkUtil:
         # Get table names and layer IDs of the edge and node tables
         (
             street_network_edge_table,
-            street_network_edge_layer_id,
             street_network_node_table,
-            street_network_node_layer_id,
-        ) = await self._get_street_network_tables(
-            edge_layer_project_id, node_layer_project_id
-        )
+        ) = await self._get_street_network_tables(edge_layer_id, node_layer_id)
 
         # Initialize cache
         street_network_cache = StreetNetworkCache()
 
         try:
             for h3_short in street_network_region_h3_3_cells:
-                if edge_layer_project_id is not None:
-                    if street_network_cache.edge_cache_exists(
-                        edge_layer_project_id, h3_short
-                    ):
+                if edge_layer_id is not None:
+                    if street_network_cache.edge_cache_exists(edge_layer_id, h3_short):
                         # Read edge data from cache
                         edge_df = street_network_cache.read_edge_cache(
-                            edge_layer_project_id, h3_short
+                            edge_layer_id, h3_short
                         )
                     else:
-                        if settings.DEBUG_MODE:
+                        if settings.ENVIRONMENT == "dev":
                             print(
                                 f"Fetching street network edge data for H3_3 cell {h3_short}"
                             )
@@ -174,7 +149,7 @@ class StreetNetworkUtil:
                                     maxspeed_backward, source, target, h3_3, h3_6
                                 FROM {street_network_edge_table}
                                 WHERE h3_3 = {h3_short}
-                                AND layer_id = '{str(street_network_edge_layer_id)}'
+                                AND layer_id = '{str(edge_layer_id)}'
                             """,
                             uri=settings.POSTGRES_DATABASE_URI,
                             schema_overrides=SEGMENT_DATA_SCHEMA,
@@ -185,22 +160,20 @@ class StreetNetworkUtil:
 
                         # Write edge data into cache
                         street_network_cache.write_edge_cache(
-                            edge_layer_project_id, h3_short, edge_df
+                            edge_layer_id, h3_short, edge_df
                         )
                     # Update street network edge dictionary and memory usage
                     street_network_edge[h3_short] = edge_df
                     street_network_size += edge_df.estimated_size("gb")
 
-                if node_layer_project_id is not None:
-                    if street_network_cache.node_cache_exists(
-                        node_layer_project_id, h3_short
-                    ):
+                if node_layer_id is not None:
+                    if street_network_cache.node_cache_exists(node_layer_id, h3_short):
                         # Read node data from cache
                         node_df = street_network_cache.read_node_cache(
-                            node_layer_project_id, h3_short
+                            node_layer_id, h3_short
                         )
                     else:
-                        if settings.DEBUG_MODE:
+                        if settings.ENVIRONMENT == "dev":
                             print(
                                 f"Fetching street network node data for H3_3 cell {h3_short}"
                             )
@@ -211,7 +184,7 @@ class StreetNetworkUtil:
                                 SELECT node_id AS id, h3_3, h3_6
                                 FROM {street_network_node_table}
                                 WHERE h3_3 = {h3_short}
-                                AND layer_id = '{str(street_network_node_layer_id)}'
+                                AND layer_id = '{str(node_layer_id)}'
                             """,
                             uri=settings.POSTGRES_DATABASE_URI,
                             schema_overrides=CONNECTOR_DATA_SCHEMA,
@@ -219,7 +192,7 @@ class StreetNetworkUtil:
 
                         # Write node data into cache
                         street_network_cache.write_node_cache(
-                            node_layer_project_id, h3_short, node_df
+                            node_layer_id, h3_short, node_df
                         )
 
                     # Update street network node dictionary and memory usage
@@ -231,23 +204,20 @@ class StreetNetworkUtil:
             )
 
         # Raise error if a edge layer project ID is specified but no edge data is fetched
-        if edge_layer_project_id is not None and len(street_network_edge) == 0:
+        if edge_layer_id is not None and len(street_network_edge) == 0:
             raise RuntimeError(
-                f"Failed to fetch street network edge data for layer project ID {edge_layer_project_id}."
+                f"Failed to fetch street network edge data for layer project ID {edge_layer_id}."
             )
 
         # Raise error if a node layer project ID is specified but no node data is fetched
-        if node_layer_project_id is not None and len(street_network_node) == 0:
+        if node_layer_id is not None and len(street_network_node) == 0:
             raise RuntimeError(
-                f"Failed to fetch street network node data for layer project ID {node_layer_project_id}."
+                f"Failed to fetch street network node data for layer project ID {node_layer_id}."
             )
 
         end_time = time.time()
 
-        if settings.DEBUG_MODE:
-            print(
-                f"Street network load time: {round((end_time - start_time) / 60, 1)} min"
-            )
-            print(f"Street network in-memory size: {round(street_network_size, 1)} GB")
+        print(f"Street network load time: {round((end_time - start_time) / 60, 1)} min")
+        print(f"Street network in-memory size: {round(street_network_size, 1)} GB")
 
         return street_network_edge, street_network_node

@@ -22,6 +22,10 @@ from src.schemas.catchment_area import (
 from src.schemas.error import BufferExceedsNetworkError, DisconnectedOriginError
 from src.utils import make_dir
 
+####################################################################################################
+# TODO: Refactor and fix
+####################################################################################################
+
 
 class FetchRoutingNetwork:
     def __init__(self, db_cursor):
@@ -196,7 +200,7 @@ class CRUDCatchmentArea:
                 maxspeed_forward, maxspeed_backward, source, target,
                 h3_3, h3_6, point_cell_index, point_h3_3
             FROM basic.get_artificial_segments(
-                {settings.STREET_NETWORK_EDGE_DEFAULT_LAYER_PROJECT_ID},
+                {obj_in.street_network_edge_layer_project_id},
                 '{input_table}',
                 {num_points},
                 '{",".join(valid_segment_classes)}',

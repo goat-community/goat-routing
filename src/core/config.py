@@ -1,4 +1,5 @@
 from typing import Any, Dict, Optional
+from uuid import UUID
 
 from pydantic import BaseSettings, PostgresDsn, validator
 
@@ -13,7 +14,9 @@ class SyncPostgresDsn(PostgresDsn):
 
 
 class Settings(BaseSettings):
-    DEBUG_MODE: bool = True
+    # Monitoring
+    SENTRY_DSN: Optional[str] = None
+    ENVIRONMENT: Optional[str] = "dev"
 
     CUSTOMER_SCHEMA: str = "customer"
     USER_DATA_SCHEMA: str = "user_data"
@@ -22,13 +25,15 @@ class Settings(BaseSettings):
     PROJECT_NAME: Optional[str] = "GOAT Routing API"
     CACHE_DIR: str = "/app/src/cache"
 
-    STREET_NETWORK_EDGE_DEFAULT_LAYER_PROJECT_ID = 36126
-    STREET_NETWORK_NODE_DEFAULT_LAYER_PROJECT_ID = 37319
-
     NETWORK_REGION_TABLE = "basic.geofence_active_mobility"
 
     CATCHMENT_AREA_CAR_BUFFER_DEFAULT_SPEED = 80  # km/h
-    CATCHMENT_AREA_HOLE_THRESHOLD_SQM = 10000  # 100m x 100m
+    CATCHMENT_AREA_HOLE_THRESHOLD_SQM = 200000  # 20 hectares, ~450m x 450m
+
+    BASE_STREET_NETWORK: Optional[UUID] = "903ecdca-b717-48db-bbce-0219e41439cf"
+    DEFAULT_STREET_NETWORK_NODE_LAYER_PROJECT_ID = (
+        37319  # Hardcoded until node layers are added to GOAT projects by default
+    )
 
     DATA_INSERT_BATCH_SIZE = 800
 
